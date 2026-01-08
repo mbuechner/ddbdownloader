@@ -49,7 +49,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = "${{ github.ref_name }}"
-          $zip = "massdownloader-${tag}-windows.zip"
+          $zip = "DDBdownloader-${tag}-windows.zip"
           if (Test-Path $zip) { Remove-Item -Force $zip }
           Compress-Archive -Path release\* -DestinationPath $zip
           Write-Host "Created $zip"
@@ -57,11 +57,11 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: massdownloader-windows
-          path: massdownloader-*-windows.zip
+          name: DDBdownloader-windows
+          path: DDBdownloader-*-windows.zip
 
       - name: Create GitHub Release (tag builds)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: massdownloader-*-windows.zip
+          files: DDBdownloader-*-windows.zip

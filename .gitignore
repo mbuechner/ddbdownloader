@@ -1,1 +1,11 @@
 /__pycache__
+
+# secrets
+.env
+
+# build outputs (PyInstaller)
+/build/
+/dist/
+/*.spec
+/*.zip
+/*.log

@@ -1,4 +1,4 @@
-# massdownloader (DDBdownloader)
+# DDBdownloader
 
 Ein robustes Python-Skript zum massenhaften Herunterladen von EDM-XML-Daten aus der API der Deutschen Digitalen Bibliothek (DDB).
 
@@ -23,6 +23,19 @@ Ein robustes Python-Skript zum massenhaften Herunterladen von EDM-XML-Daten aus 
 ```powershell
 py -m pip install requests
 ```
+
+## API-Key (.env)
+
+Für den EDM-Download wird ein API-Key benötigt. Lege im Projektordner eine Datei `.env` an:
+
+```text
+DDB_API_KEY=DEIN_KEY
+```
+
+Vorlage: `.env.example` (diese Datei kann kopiert werden).
+
+Der Key wird **nicht** als Header gesendet, sondern als Query-Parameter `oauth_consumer_key` an den Item-Endpunkt angehängt.
+Im Log wird der Key nur gekürzt ausgegeben.
 
 ## Aufruf
 

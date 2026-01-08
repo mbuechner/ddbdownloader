@@ -173,12 +173,23 @@ class App(tk.Tk):
 
 		# Start subprocess
 		try:
+			startupinfo = None
+			creationflags = 0
+			if os.name == "nt":
+				# Verhindert das Öffnen eines Konsolenfensters (z.B. bei DDBdownloader.exe).
+				creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+				startupinfo = subprocess.STARTUPINFO()
+				startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+				startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+
 			self.proc = subprocess.Popen(
 				cmd,
 				stdout=subprocess.PIPE,
 				stderr=subprocess.PIPE,
 				text=True,
 				bufsize=0,
+				startupinfo=startupinfo,
+				creationflags=creationflags,
 			)
 		except Exception as exc:
 			self.proc = None
