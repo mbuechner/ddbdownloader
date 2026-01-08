@@ -39,18 +39,10 @@ Im Log wird der Key nur gekürzt ausgegeben.
 
 ## Aufruf
 
-Es gibt zwei Möglichkeiten:
-
-1. Direkt über Python:
+Direkt über Python:
 
 ```powershell
 py .\DDBdownloader.py -q "dataset_id:73873569924928456gWuT" -o "output.zip" -b 1000
-```
-
-2. Über den Windows-Wrapper (wie in der Aufgabenstellung):
-
-```powershell
-.\DDBdownloader.cmd -q "dataset_id:73873569924928456gWuT" -o "output.zip" -b 1000
 ```
 
 ## Kleine GUI
