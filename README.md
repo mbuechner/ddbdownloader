@@ -26,10 +26,18 @@ py -m pip install requests
 
 ## API-Key (.env)
 
-Für den EDM-Download wird ein API-Key benötigt. Lege im Projektordner eine Datei `.env` an:
+Für den EDM-Download wird ein API-Key benötigt. Lege im Projektordner eine Datei `.env` an.
+
+Standard-API (Production):
 
 ```text
 DDB_API_KEY=DEIN_KEY
+```
+
+Optional (Q1-API):
+
+```text
+DDB_Q1_API_KEY=DEIN_KEY
 ```
 
 Vorlage: `.env.example` (diese Datei kann kopiert werden).
@@ -56,7 +64,7 @@ py .\DDBdownloader_gui.py
 ```
 
 In der GUI:
-- Query, Output, Batch und Threads setzen
+- API, Query, Output und Batch setzen
 - `Start` startet den Download
 - `Stop` beendet den laufenden Prozess
 - Live-Status erscheint oben; Details laufen in der Textbox und in `output.log`
@@ -79,6 +87,7 @@ Hinweis: Im ZIP liegt zusätzlich `DDBdownloader.exe` (CLI). Die GUI nutzt diese
 - `-q/--query` – Solr-Query (wird als `q=` an die Solr-Select-API übergeben)
 - `-o/--output` – Name der ZIP-Ausgabe (Logdatei wird daneben als `output.log` erstellt)
 - `-b/--batch` – maximale Anzahl XML-Dateien pro ZIP (0 = alles in eine ZIP)
+- `--api` – API-Basis (z.B. `https://api.deutsche-digitale-bibliothek.de` oder `https://api-q1.deutsche-digitale-bibliothek.de`)
 - `--threads` – Download-Parallelität (Default: 16)
 - `--rows` – IDs pro Solr-Seite (Default: 100000)
 - `--timeout` – HTTP Timeout (Default: 30s)

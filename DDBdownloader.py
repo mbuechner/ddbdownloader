@@ -35,8 +35,28 @@ except Exception as exc:  # pragma: no cover
 	)
 
 
-SEARCH_URL = "https://api.deutsche-digitale-bibliothek.de/2/search/index/search/select"
-ITEM_URL_TMPL = "https://api.deutsche-digitale-bibliothek.de/items/{id}/edm?oauth_consumer_key={api_key}"
+API_BASES = (
+	"https://api.deutsche-digitale-bibliothek.de",
+	"https://api-q1.deutsche-digitale-bibliothek.de",
+)
+
+
+def _normalize_api_base(value: str) -> str:
+	v = (value or "").strip()
+	if not v:
+		return API_BASES[0]
+	if v.startswith("http://") or v.startswith("https://"):
+		return v.rstrip("/")
+	# Hostname ohne Schema
+	return f"https://{v.rstrip('/')}"
+
+
+def _search_url(api_base: str) -> str:
+	return f"{api_base}/2/search/index/search/select"
+
+
+def _item_url_tmpl(api_base: str) -> str:
+	return f"{api_base}/items/{{id}}/edm?oauth_consumer_key={{api_key}}"
 
 DEFAULT_ROWS = 100_000
 DEFAULT_THREADS = 16
@@ -119,6 +139,14 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 		help=(
 			"Maximale Anzahl XML-Dateien pro ZIP. 0 oder weglassen: alles in eine ZIP. "
 			"Bei >0 werden output-1.zip, output-2.zip ... erstellt."
+		),
+	)
+	p.add_argument(
+		"--api",
+		default=API_BASES[0],
+		help=(
+			"API Base-URL. Unterstützt z.B. https://api.deutsche-digitale-bibliothek.de und "
+			"https://api-q1.deutsche-digitale-bibliothek.de"
 		),
 	)
 	p.add_argument(
@@ -206,12 +234,27 @@ def _parse_dotenv(path: str) -> Dict[str, str]:
 	return data
 
 
-def _load_api_key() -> Tuple[str, Optional[str]]:
+def _key_names_for_api(api_base: str) -> Tuple[str, ...]:
+	api = _normalize_api_base(api_base)
+	if api == "https://api-q1.deutsche-digitale-bibliothek.de":
+		return (
+			"DDB_Q1_API_KEY",
+			"DDB_API_Q1_KEY",
+			"API_Q1_KEY",
+		)
+	# Default/Prod
+	return (
+		"DDB_API_KEY",
+		"API_KEY",
+	)
+
+
+def _load_api_key(api_base: str) -> Tuple[str, Optional[str]]:
 	"""Lädt den API-Key aus .env oder ENV.
 
-	Unterstützte Namen:
-	- DDB_API_KEY (bevorzugt)
-	- API_KEY
+	Unterstützte Namen (abhängig von der API):
+	- https://api.deutsche-digitale-bibliothek.de  -> DDB_API_KEY (oder API_KEY)
+	- https://api-q1.deutsche-digitale-bibliothek.de -> DDB_Q1_API_KEY (oder DDB_API_Q1_KEY)
 	
 	Sucht .env in:
 	- CWD
@@ -220,8 +263,10 @@ def _load_api_key() -> Tuple[str, Optional[str]]:
 	
 	Returns: (api_key, source)
 	"""
+	key_names = _key_names_for_api(api_base)
+
 	# 1) ENV hat Vorrang
-	for env_name in ("DDB_API_KEY", "API_KEY"):
+	for env_name in key_names:
 		v = os.environ.get(env_name, "").strip()
 		if v:
 			return v, f"ENV:{env_name}"
@@ -246,7 +291,7 @@ def _load_api_key() -> Tuple[str, Optional[str]]:
 			continue
 		seen.add(p)
 		env = _parse_dotenv(p)
-		for key_name in ("DDB_API_KEY", "API_KEY"):
+		for key_name in key_names:
 			v = (env.get(key_name) or "").strip()
 			if v:
 				return v, f"dotenv:{p} ({key_name})"
@@ -256,6 +301,7 @@ def _load_api_key() -> Tuple[str, Optional[str]]:
 
 def _solr_fetch_ids(
 	session: requests.Session,
+	search_url: str,
 	query: str,
 	rows: int,
 	timeout: float,
@@ -284,7 +330,7 @@ def _solr_fetch_ids(
 				"rows": rows,
 				"wt": "json",
 			}
-			resp = session.get(SEARCH_URL, params=params, timeout=timeout)
+			resp = session.get(search_url, params=params, timeout=timeout)
 			if resp.status_code != 200:
 				logger.error(
 					"Solr-Abfrage fehlgeschlagen: HTTP %s; start=%s; body=%s",
@@ -353,10 +399,11 @@ def _download_one(
 	session: requests.Session,
 	item_id: str,
 	api_key: str,
+	item_url_tmpl: str,
 	headers: Dict[str, str],
 	timeout: float,
 ) -> Tuple[int, bytes]:
-	url = ITEM_URL_TMPL.format(id=item_id, api_key=quote(api_key, safe=""))
+	url = item_url_tmpl.format(id=item_id, api_key=quote(api_key, safe=""))
 	resp = session.get(url, headers=headers, timeout=timeout)
 	return resp.status_code, resp.content
 
@@ -457,14 +504,20 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	log_path = os.path.splitext(args.output)[0] + ".log"
 	logger = _configure_logger(log_path, args.verbose)
 
-	api_key, api_key_src = _load_api_key()
+	api_base = _normalize_api_base(args.api)
+	search_url = _search_url(api_base)
+	item_url_tmpl = _item_url_tmpl(api_base)
+
+	api_key, api_key_src = _load_api_key(api_base)
 	if not api_key:
 		logger.error(
-			"Kein API-Key gefunden. Lege eine .env Datei an (z.B. DDB_API_KEY=... ) oder setze die Umgebungsvariable DDB_API_KEY."
+			"Kein API-Key gefunden. Lege eine .env Datei an (z.B. DDB_API_KEY=... oder DDB_Q1_API_KEY=...) "
+			"oder setze die passende Umgebungsvariable."
 		)
-		print("Fehler: Kein API-Key gefunden. Bitte .env mit DDB_API_KEY=... anlegen.")
+		print("Fehler: Kein API-Key gefunden. Bitte .env anlegen (DDB_API_KEY oder DDB_Q1_API_KEY).")
 		return 2
 
+	logger.info("API: %s", api_base)
 	logger.info("API-Key geladen (%s): %s", api_key_src or "unbekannt", _mask_api_key(api_key))
 
 	# Schritt 1: IDs einsammeln
@@ -474,6 +527,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 		try:
 			ids_path, total_ids = _solr_fetch_ids(
 				session=session,
+				search_url=search_url,
 				query=args.query,
 				rows=args.rows,
 				timeout=args.timeout,
@@ -546,7 +600,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
 		for attempt in range(1, args.retries + 2):
 			try:
-				status_code, body = _download_one(s, item_id, api_key=api_key, headers=headers, timeout=args.timeout)
+				status_code, body = _download_one(
+					s,
+					item_id,
+					api_key=api_key,
+					item_url_tmpl=item_url_tmpl,
+					headers=headers,
+					timeout=args.timeout,
+				)
 				if status_code == 200:
 					if not body or len(body.strip()) == 0:
 						with counters_lock:
@@ -648,6 +709,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	rate = done / elapsed
 
 	stats = {
+		"api_base": api_base,
 		"total_ids": counters.total_ids,
 		"done": done,
 		"downloaded_ok": counters.downloaded_ok,

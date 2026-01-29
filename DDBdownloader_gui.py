@@ -11,6 +11,11 @@ from tkinter import filedialog, messagebox
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADER_PY = os.path.join(SCRIPT_DIR, "DDBdownloader.py")
 
+API_BASES = [
+	"https://api.deutsche-digitale-bibliothek.de",
+	"https://api-q1.deutsche-digitale-bibliothek.de",
+]
+
 
 def _is_frozen() -> bool:
 	return bool(getattr(sys, "frozen", False))
@@ -59,28 +64,34 @@ class App(tk.Tk):
 		frm = tk.Frame(self)
 		frm.pack(fill=tk.X, padx=10, pady=10)
 
+		# API
+		tk.Label(frm, text="API:").grid(row=0, column=0, sticky="w")
+		self.var_api = tk.StringVar(value=API_BASES[0])
+		api_menu = tk.OptionMenu(frm, self.var_api, *API_BASES)
+		api_menu.grid(row=0, column=1, sticky="w", padx=(5, 0))
+
 		# Query
-		tk.Label(frm, text="Query (-q):").grid(row=0, column=0, sticky="w")
+		tk.Label(frm, text="Query (-q):").grid(row=1, column=0, sticky="w", pady=(6, 0))
 		self.var_query = tk.StringVar(value='dataset_id:')
-		tk.Entry(frm, textvariable=self.var_query, width=80).grid(row=0, column=1, sticky="we", padx=(5, 5))
+		tk.Entry(frm, textvariable=self.var_query, width=80).grid(row=1, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
 
 		# Output
-		tk.Label(frm, text="Output ZIP (-o):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+		tk.Label(frm, text="Output ZIP (-o):").grid(row=2, column=0, sticky="w", pady=(6, 0))
 		self.var_output = tk.StringVar(value=os.path.join(SCRIPT_DIR, "output.zip"))
-		tk.Entry(frm, textvariable=self.var_output, width=80).grid(row=1, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
-		tk.Button(frm, text="…", width=3, command=self._browse_output).grid(row=1, column=2, pady=(6, 0))
+		tk.Entry(frm, textvariable=self.var_output, width=80).grid(row=2, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
+		tk.Button(frm, text="…", width=3, command=self._browse_output).grid(row=2, column=2, pady=(6, 0))
 
 		# Batch + Threads
-		tk.Label(frm, text="Batch (-b):").grid(row=2, column=0, sticky="w", pady=(6, 0))
+		tk.Label(frm, text="Batch (-b):").grid(row=3, column=0, sticky="w", pady=(6, 0))
 		self.var_batch = tk.StringVar(value="0")
 		batch_entry = tk.Entry(frm, textvariable=self.var_batch, width=12)
-		batch_entry.grid(row=2, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
+		batch_entry.grid(row=3, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
 
 		# Threads sind bewusst nicht konfigurierbar – der Downloader nutzt Default=16.
 
 		# Buttons
 		btns = tk.Frame(frm)
-		btns.grid(row=3, column=1, sticky="w", pady=(10, 0))
+		btns.grid(row=4, column=1, sticky="w", pady=(10, 0))
 		self.btn_start = tk.Button(btns, text="Start", width=12, command=self._start)
 		self.btn_start.pack(side=tk.LEFT)
 		self.btn_stop = tk.Button(btns, text="Stop", width=12, state=tk.DISABLED, command=self._stop)
@@ -122,7 +133,10 @@ class App(tk.Tk):
 		self.last_status = s
 		self.lbl_status.configure(text=s)
 
-	def _validate(self) -> tuple[str, str, int]:
+	def _validate(self) -> tuple[str, str, int, str]:
+		api = (self.var_api.get() or "").strip()
+		if not api:
+			raise ValueError("API ist leer.")
 		q = (self.var_query.get() or "").strip()
 		out = (self.var_output.get() or "").strip()
 		if not q:
@@ -134,19 +148,21 @@ class App(tk.Tk):
 		batch = int(batch_raw) if batch_raw else 0
 		if batch < 0:
 			raise ValueError("Batch (-b) muss >= 0 sein.")
-		return q, out, batch
+		return q, out, batch, api
 
 	def _start(self):
 		if self.proc is not None:
 			return
 
 		try:
-			q, out, batch = self._validate()
+			q, out, batch, api = self._validate()
 		except Exception as exc:
 			messagebox.showerror("Ungültige Eingabe", str(exc))
 			return
 
 		cmd = _downloader_command() + [
+			"--api",
+			api,
 			"-q",
 			q,
 			"-o",

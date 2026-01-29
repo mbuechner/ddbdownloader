@@ -43,6 +43,7 @@ jobs:
           Copy-Item -Force dist\DDBdownloader.exe release\
           Copy-Item -Force dist\DDBdownloader_gui.exe release\
           Copy-Item -Force README.md release\
+          Copy-Item -Force .env.example release\
 
       - name: Create ZIP
         shell: pwsh
