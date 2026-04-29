@@ -1,4 +1,3 @@
-
 """DDBdownloader
 
 Massendownload von EDM-XML über die API der Deutschen Digitalen Bibliothek.
@@ -19,7 +18,6 @@ import tempfile
 import threading
 import time
 import zipfile
-from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
@@ -36,8 +34,8 @@ except Exception as exc:  # pragma: no cover
 
 
 API_BASES = (
-	"https://api.deutsche-digitale-bibliothek.de",
-	"https://api-q1.deutsche-digitale-bibliothek.de",
+	"https://api.deutsche-digitale-bibliothek.de/2",
+	"https://api-q1.deutsche-digitale-bibliothek.de/2",
 )
 
 
@@ -52,11 +50,11 @@ def _normalize_api_base(value: str) -> str:
 
 
 def _search_url(api_base: str) -> str:
-	return f"{api_base}/2/search/index/search/select"
+	return f"{api_base}/search/index/search/select"
 
 
 def _item_url_tmpl(api_base: str) -> str:
-	return f"{api_base}/items/{{id}}/edm?oauth_consumer_key={{api_key}}"
+	return f"{api_base}/items/{{id}}/edm"
 
 DEFAULT_ROWS = 100_000
 DEFAULT_THREADS = 16
@@ -145,8 +143,8 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 		"--api",
 		default=API_BASES[0],
 		help=(
-			"API Base-URL. Unterstützt z.B. https://api.deutsche-digitale-bibliothek.de und "
-			"https://api-q1.deutsche-digitale-bibliothek.de"
+			"API Base-URL. Unterstützt z.B. https://api.deutsche-digitale-bibliothek.de/2 und "
+			"https://api-q1.deutsche-digitale-bibliothek.de/2"
 		),
 	)
 	p.add_argument(
@@ -203,100 +201,6 @@ def _http_headers() -> Dict[str, str]:
 		"User-Agent": "DDBdownloader/1.0",
 	}
 	return headers
-
-
-def _mask_api_key(api_key: str) -> str:
-	key = (api_key or "").strip()
-	if not key:
-		return "<leer>"
-	if len(key) <= 8:
-		return key[:2] + "…" + key[-2:]
-	return key[:4] + "…" + key[-4:]
-
-
-def _parse_dotenv(path: str) -> Dict[str, str]:
-	data: Dict[str, str] = {}
-	try:
-		with open(path, "r", encoding="utf-8") as f:
-			for raw in f:
-				line = raw.strip()
-				if not line or line.startswith("#"):
-					continue
-				if "=" not in line:
-					continue
-				k, v = line.split("=", 1)
-				k = k.strip()
-				v = v.strip().strip('"').strip("'")
-				if k:
-					data[k] = v
-	except FileNotFoundError:
-		return {}
-	return data
-
-
-def _key_names_for_api(api_base: str) -> Tuple[str, ...]:
-	api = _normalize_api_base(api_base)
-	if api == "https://api-q1.deutsche-digitale-bibliothek.de":
-		return (
-			"DDB_Q1_API_KEY",
-			"DDB_API_Q1_KEY",
-			"API_Q1_KEY",
-		)
-	# Default/Prod
-	return (
-		"DDB_API_KEY",
-		"API_KEY",
-	)
-
-
-def _load_api_key(api_base: str) -> Tuple[str, Optional[str]]:
-	"""Lädt den API-Key aus .env oder ENV.
-
-	Unterstützte Namen (abhängig von der API):
-	- https://api.deutsche-digitale-bibliothek.de  -> DDB_API_KEY (oder API_KEY)
-	- https://api-q1.deutsche-digitale-bibliothek.de -> DDB_Q1_API_KEY (oder DDB_API_Q1_KEY)
-	
-	Sucht .env in:
-	- CWD
-	- Script-Ordner
-	- (wenn frozen) EXE-Ordner
-	
-	Returns: (api_key, source)
-	"""
-	key_names = _key_names_for_api(api_base)
-
-	# 1) ENV hat Vorrang
-	for env_name in key_names:
-		v = os.environ.get(env_name, "").strip()
-		if v:
-			return v, f"ENV:{env_name}"
-
-	# 2) .env suchen
-	candidates = []
-	try:
-		candidates.append(os.path.join(os.getcwd(), ".env"))
-	except Exception:
-		pass
-
-	# Script dir
-	candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-
-	# EXE dir (PyInstaller)
-	if bool(getattr(sys, "frozen", False)):
-		candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), ".env"))
-
-	seen = set()
-	for p in candidates:
-		if p in seen:
-			continue
-		seen.add(p)
-		env = _parse_dotenv(p)
-		for key_name in key_names:
-			v = (env.get(key_name) or "").strip()
-			if v:
-				return v, f"dotenv:{p} ({key_name})"
-
-	return "", None
 
 
 def _solr_fetch_ids(
@@ -398,12 +302,11 @@ def _iter_ids_from_file(path: str) -> Iterable[str]:
 def _download_one(
 	session: requests.Session,
 	item_id: str,
-	api_key: str,
 	item_url_tmpl: str,
 	headers: Dict[str, str],
 	timeout: float,
 ) -> Tuple[int, bytes]:
-	url = item_url_tmpl.format(id=item_id, api_key=quote(api_key, safe=""))
+	url = item_url_tmpl.format(id=item_id)
 	resp = session.get(url, headers=headers, timeout=timeout)
 	return resp.status_code, resp.content
 
@@ -458,7 +361,7 @@ class ZipRotatingWriter:
 	def __init__(self, base_output: str, batch_size: int, logger: logging.Logger):
 		self.base_output = base_output
 		self.batch_size = batch_size
-		self.use_split = batch_size and batch_size > 0
+		self.use_split = bool(batch_size and batch_size > 0)
 		self.logger = logger
 
 		self._zip_index = 1
@@ -486,6 +389,7 @@ class ZipRotatingWriter:
 			self._open_new_zip()
 
 		arcname = f"{item_id}.xml"
+		assert self._zip is not None, "ZIP file is not open"
 		self._zip.writestr(arcname, xml_bytes)
 		self._zip_count += 1
 
@@ -508,17 +412,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	search_url = _search_url(api_base)
 	item_url_tmpl = _item_url_tmpl(api_base)
 
-	api_key, api_key_src = _load_api_key(api_base)
-	if not api_key:
-		logger.error(
-			"Kein API-Key gefunden. Lege eine .env Datei an (z.B. DDB_API_KEY=... oder DDB_Q1_API_KEY=...) "
-			"oder setze die passende Umgebungsvariable."
-		)
-		print("Fehler: Kein API-Key gefunden. Bitte .env anlegen (DDB_API_KEY oder DDB_Q1_API_KEY).")
-		return 2
-
 	logger.info("API: %s", api_base)
-	logger.info("API-Key geladen (%s): %s", api_key_src or "unbekannt", _mask_api_key(api_key))
 
 	# Schritt 1: IDs einsammeln
 	with requests.Session() as session:
@@ -603,7 +497,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 				status_code, body = _download_one(
 					s,
 					item_id,
-					api_key=api_key,
 					item_url_tmpl=item_url_tmpl,
 					headers=headers,
 					timeout=args.timeout,

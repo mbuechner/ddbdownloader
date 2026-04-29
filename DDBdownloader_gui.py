@@ -12,8 +12,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADER_PY = os.path.join(SCRIPT_DIR, "DDBdownloader.py")
 
 API_BASES = [
-	"https://api.deutsche-digitale-bibliothek.de",
-	"https://api-q1.deutsche-digitale-bibliothek.de",
+	"https://api.deutsche-digitale-bibliothek.de/2",
+	"https://api-q1.deutsche-digitale-bibliothek.de/2",
 ]
 
 
