@@ -76,6 +76,7 @@ class Counters:
 	total_ids: int = 0
 	downloaded_ok: int = 0
 	downloaded_empty: int = 0
+	no_edm: int = 0
 	http_errors: int = 0
 	exceptions: int = 0
 	retries: int = 0
@@ -126,8 +127,8 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 	p.add_argument(
 		"-o",
 		"--output",
-		required=True,
-		help='Output ZIP, z.B. "output.zip" (Logdatei wird daneben als output.log angelegt)',
+		default="",
+		help='Output ZIP, z.B. "output.zip" (Logdatei wird daneben als output.log angelegt). Im --head-only Modus optional.',
 	)
 	p.add_argument(
 		"-b",
@@ -181,6 +182,15 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 		"--verbose",
 		action="store_true",
 		help="Mehr Konsolen-Logs (zusätzlich zur Statusanzeige; Details stehen immer in output.log)",
+	)
+	p.add_argument(
+		"--head-only",
+		action="store_true",
+		help=(
+			"Nur HEAD-Requests senden (kein Download, kein ZIP). "
+			"Prüft, wie viele IDs tatsächlich ein EDM besitzen. "
+			"404/409 gelten als 'kein EDM'; andere Fehler bekommen Retries."
+		),
 	)
 	return p.parse_args(list(argv) if argv is not None else None)
 
@@ -405,7 +415,16 @@ class ZipRotatingWriter:
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
 	args = _parse_args(argv)
-	log_path = os.path.splitext(args.output)[0] + ".log"
+
+	if not args.head_only and not args.output:
+		print("Fehler: -o/--output ist erforderlich (außer bei --head-only).", file=sys.stderr)
+		return 2
+
+	if args.output:
+		log_path = os.path.splitext(args.output)[0] + ".log"
+	else:
+		log_path = "ddbdownloader.log"
+
 	logger = _configure_logger(log_path, args.verbose)
 
 	api_base = _normalize_api_base(args.api)
@@ -475,8 +494,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 			except Exception:
 				logger.exception("Fehler beim Schließen der ZIP")
 
-	writer_thread = threading.Thread(target=writer_worker, name="zip-writer", daemon=True)
-	writer_thread.start()
+	writer_thread: Optional[threading.Thread] = None
+	if not args.head_only:
+		writer_thread = threading.Thread(target=writer_worker, name="zip-writer", daemon=True)
+		writer_thread.start()
 
 	# Per-Thread Session (requests.Session ist nicht offiziell thread-safe)
 	thread_local = threading.local()
@@ -491,6 +512,50 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	def download_task(item_id: str) -> None:
 		nonlocal counters
 		s = get_session()
+
+		if args.head_only:
+			url = item_url_tmpl.format(id=item_id)
+			for attempt in range(1, args.retries + 2):
+				try:
+					resp = s.head(url, headers=headers, timeout=args.timeout)
+					sc = resp.status_code
+					if sc == 200:
+						with counters_lock:
+							counters.downloaded_ok += 1
+						return
+					if sc in (404, 409):
+						with counters_lock:
+							counters.no_edm += 1
+						logger.debug("Kein EDM (HTTP %s): id=%s", sc, item_id)
+						return
+					if sc in (408, 429, 500, 502, 503, 504):
+						with counters_lock:
+							counters.retries += 1
+						if attempt <= args.retries:
+							logger.warning("HEAD Retry %s/%s: HTTP %s id=%s", attempt, args.retries, sc, item_id)
+							_sleep_backoff(args.backoff, attempt)
+							continue
+					with counters_lock:
+						counters.http_errors += 1
+					logger.error("HEAD HTTP Fehler %s: id=%s", sc, item_id)
+					return
+				except (requests.Timeout, requests.ConnectionError) as exc:
+					with counters_lock:
+						counters.retries += 1
+					if attempt <= args.retries:
+						logger.warning("HEAD Retry %s/%s: %s id=%s", attempt, args.retries, type(exc).__name__, item_id)
+						_sleep_backoff(args.backoff, attempt)
+						continue
+					with counters_lock:
+						counters.exceptions += 1
+					logger.exception("HEAD Netzwerkfehler (final): id=%s", item_id)
+					return
+				except Exception:
+					with counters_lock:
+						counters.exceptions += 1
+					logger.exception("HEAD Unerwarteter Fehler: id=%s", item_id)
+					return
+			return
 
 		for attempt in range(1, args.retries + 2):
 			try:
@@ -518,6 +583,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 					with counters_lock:
 						counters.queued_to_zip += 1
 						counters.downloaded_ok += 1
+					return
+
+				# Kein EDM vorhanden – kein Retry
+				if status_code in (404, 409):
+					with counters_lock:
+						counters.no_edm += 1
+					logger.debug("Kein EDM (HTTP %s): id=%s", status_code, item_id)
 					return
 
 				# typische transient errors
@@ -580,8 +652,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 						pass
 
 		# Alle Downloads fertig -> Writer beenden
-		q_items.put(None)
-		writer_thread.join()
+		if writer_thread is not None:
+			q_items.put(None)
+			writer_thread.join()
 
 	finally:
 		phase["value"] = "final"
@@ -598,13 +671,26 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	# Abschluss
 	sys.stderr.write("\n")
 	elapsed = max(0.001, time.time() - started_at)
-	done = counters.downloaded_ok + counters.downloaded_empty + counters.http_errors + counters.exceptions
+	done = counters.downloaded_ok + counters.downloaded_empty + counters.no_edm + counters.http_errors + counters.exceptions
 	rate = done / elapsed
 
+	if args.head_only:
+		print(f"\nErgebnis HEAD-Prüfung:")
+		print(f"  Gesamt geprüft : {_fmt_int_de(done)}")
+		print(f"  Mit EDM (200)  : {_fmt_int_de(counters.downloaded_ok)}")
+		print(f"  Ohne EDM (404/409): {_fmt_int_de(counters.no_edm)}")
+		print(f"  HTTP-Fehler     : {_fmt_int_de(counters.http_errors)}")
+		print(f"  Exceptions      : {_fmt_int_de(counters.exceptions)}")
+		print(f"  Retries         : {_fmt_int_de(counters.retries)}")
+		print(f"  Durchsatz       : {_fmt_float_de(rate, 1)}/s")
+
 	stats = {
+		"mode": "head-only" if args.head_only else "download",
 		"api_base": api_base,
 		"total_ids": counters.total_ids,
 		"done": done,
+		"with_edm": counters.downloaded_ok,
+		"without_edm": counters.no_edm,
 		"downloaded_ok": counters.downloaded_ok,
 		"downloaded_empty": counters.downloaded_empty,
 		"http_errors": counters.http_errors,
@@ -619,7 +705,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 		"threads": args.threads,
 	}
 
-	print("\nStatistik:")
+	if not args.head_only:
+		print("\nStatistik:")
+	else:
+		print("\nDetails (JSON):")
 	print(json.dumps(stats, indent=2, ensure_ascii=False))
 	logger.info("Fertig. Statistik: %s", json.dumps(stats, ensure_ascii=False))
 

@@ -78,20 +78,33 @@ class App(tk.Tk):
 		# Output
 		tk.Label(frm, text="Output ZIP (-o):").grid(row=2, column=0, sticky="w", pady=(6, 0))
 		self.var_output = tk.StringVar(value=os.path.join(SCRIPT_DIR, "output.zip"))
-		tk.Entry(frm, textvariable=self.var_output, width=80).grid(row=2, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
-		tk.Button(frm, text="…", width=3, command=self._browse_output).grid(row=2, column=2, pady=(6, 0))
+		out_entry = tk.Entry(frm, textvariable=self.var_output, width=80)
+		out_entry.grid(row=2, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
+		out_btn = tk.Button(frm, text="…", width=3, command=self._browse_output)
+		out_btn.grid(row=2, column=2, pady=(6, 0))
+		self._output_widgets = [out_entry, out_btn]
 
 		# Batch + Threads
-		tk.Label(frm, text="Batch (-b):").grid(row=3, column=0, sticky="w", pady=(6, 0))
+		tk.Label(frm, text="Batchgröße ZIP (-b):").grid(row=3, column=0, sticky="w", pady=(6, 0))
 		self.var_batch = tk.StringVar(value="0")
 		batch_entry = tk.Entry(frm, textvariable=self.var_batch, width=12)
 		batch_entry.grid(row=3, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
+
+		# HEAD-only Modus
+		self.var_head_only = tk.BooleanVar(value=False)
+		head_chk = tk.Checkbutton(
+			frm,
+			text="Kein Download, nur Statistik (--head-only)",
+			variable=self.var_head_only,
+			command=self._on_head_only_toggle,
+		)
+		head_chk.grid(row=4, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
 
 		# Threads sind bewusst nicht konfigurierbar – der Downloader nutzt Default=16.
 
 		# Buttons
 		btns = tk.Frame(frm)
-		btns.grid(row=4, column=1, sticky="w", pady=(10, 0))
+		btns.grid(row=5, column=1, sticky="w", pady=(10, 0))
 		self.btn_start = tk.Button(btns, text="Start", width=12, command=self._start)
 		self.btn_start.pack(side=tk.LEFT)
 		self.btn_stop = tk.Button(btns, text="Stop", width=12, state=tk.DISABLED, command=self._stop)
@@ -115,6 +128,12 @@ class App(tk.Tk):
 		# Make column 1 expand
 		frm.grid_columnconfigure(1, weight=1)
 
+	def _on_head_only_toggle(self):
+		"""Output- und Batch-Feld bei HEAD-only de-/aktivieren."""
+		state = tk.DISABLED if self.var_head_only.get() else tk.NORMAL
+		for w in self._output_widgets:
+			w.configure(state=state)
+
 	def _browse_output(self):
 		path = filedialog.asksaveasfilename(
 			title="Output ZIP auswählen",
@@ -133,29 +152,30 @@ class App(tk.Tk):
 		self.last_status = s
 		self.lbl_status.configure(text=s)
 
-	def _validate(self) -> tuple[str, str, int, str]:
+	def _validate(self) -> tuple[str, str, int, str, bool]:
 		api = (self.var_api.get() or "").strip()
 		if not api:
 			raise ValueError("API ist leer.")
 		q = (self.var_query.get() or "").strip()
 		out = (self.var_output.get() or "").strip()
+		head_only = self.var_head_only.get()
 		if not q:
 			raise ValueError("Query (-q) ist leer.")
-		if not out:
-			raise ValueError("Output (-o) ist leer.")
+		if not head_only and not out:
+			raise ValueError("Output (-o) ist leer (nur bei HEAD-only optional).")
 
 		batch_raw = (self.var_batch.get() or "").strip()
 		batch = int(batch_raw) if batch_raw else 0
 		if batch < 0:
 			raise ValueError("Batch (-b) muss >= 0 sein.")
-		return q, out, batch, api
+		return q, out, batch, api, head_only
 
 	def _start(self):
 		if self.proc is not None:
 			return
 
 		try:
-			q, out, batch, api = self._validate()
+			q, out, batch, api, head_only = self._validate()
 		except Exception as exc:
 			messagebox.showerror("Ungültige Eingabe", str(exc))
 			return
@@ -165,10 +185,12 @@ class App(tk.Tk):
 			api,
 			"-q",
 			q,
-			"-o",
-			out,
 		]
-		if batch:
+		if out:
+			cmd += ["-o", out]
+		if head_only:
+			cmd += ["--head-only"]
+		elif batch:
 			cmd += ["-b", str(batch)]
 
 		# Existenz-Check passend zum Modus
