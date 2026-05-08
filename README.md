@@ -73,7 +73,8 @@ Hinweis: Im ZIP liegt zusätzlich `DDBdownloader.exe` (CLI). Die GUI nutzt diese
 - `--api` – API-Basis (z.B. `https://api.deutsche-digitale-bibliothek.de` oder `https://api-q1.deutsche-digitale-bibliothek.de`)
 - `--threads` – Download-Parallelität (Default: 16)
 - `--rows` – IDs pro Solr-Seite (Default: 100000)
-- `--timeout` – HTTP Timeout (Default: 30s)
+- `--timeout` – HTTP Timeout für Item-Downloads (Default: 30s)
+- `--solr-timeout` – Read-Timeout für Solr-ID-Abfragen (Default: 180s)
 - `--retries` – Retries pro Objekt (Default: 4, zusätzlich zum ersten Versuch)
 - `--backoff` – Basis für exponentiellen Backoff (Default: 1.0)
 
@@ -92,4 +93,4 @@ Hinweis: Im ZIP liegt zusätzlich `DDBdownloader.exe` (CLI). Die GUI nutzt diese
 
 - Das Skript lädt die IDs nicht komplett in RAM, sondern streamt sie über eine temporäre Datei.
 - Die Anzahl gleichzeitig „ausstehender“ Download-Aufgaben ist begrenzt, um Memory-Spikes bei Millionen IDs zu vermeiden.
-- Bei API-Problemen (Timeouts, 429, 5xx, leere Antworten) werden Retries versucht und alles in der Logdatei protokolliert.
+- Bei Solr- und API-Problemen (Timeouts, 429, 5xx, ungültige Solr-Antworten, leere Antworten) werden Retries versucht und alles in der Logdatei protokolliert.

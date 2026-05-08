@@ -58,6 +58,8 @@ def _item_url_tmpl(api_base: str) -> str:
 
 DEFAULT_ROWS = 100_000
 DEFAULT_THREADS = 16
+DEFAULT_ITEM_TIMEOUT = 30.0
+DEFAULT_SOLR_TIMEOUT = 180.0
 
 
 def _fmt_int_de(value: int) -> str:
@@ -163,8 +165,14 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 	p.add_argument(
 		"--timeout",
 		type=float,
-		default=30.0,
-		help="HTTP Timeout in Sekunden (Default: 30; gilt für Solr und Item-Downloads)",
+		default=DEFAULT_ITEM_TIMEOUT,
+		help="HTTP Timeout in Sekunden für Item-Downloads (Default: 30)",
+	)
+	p.add_argument(
+		"--solr-timeout",
+		type=float,
+		default=DEFAULT_SOLR_TIMEOUT,
+		help="Read-Timeout in Sekunden für Solr-ID-Abfragen (Default: 180)",
 	)
 	p.add_argument(
 		"--retries",
@@ -219,6 +227,8 @@ def _solr_fetch_ids(
 	query: str,
 	rows: int,
 	timeout: float,
+	retries: int,
+	backoff: float,
 	logger: logging.Logger,
 ) -> Tuple[str, int]:
 	"""Liest alle IDs seitenweise ein und schreibt sie in eine Temp-Datei.
@@ -244,17 +254,62 @@ def _solr_fetch_ids(
 				"rows": rows,
 				"wt": "json",
 			}
-			resp = session.get(search_url, params=params, timeout=timeout)
-			if resp.status_code != 200:
-				logger.error(
-					"Solr-Abfrage fehlgeschlagen: HTTP %s; start=%s; body=%s",
-					resp.status_code,
-					start,
-					resp.text[:2000],
-				)
-				resp.raise_for_status()
 
-			data = resp.json()
+			data = None
+			for attempt in range(1, retries + 2):
+				try:
+					resp = session.get(
+						search_url,
+						params=params,
+						timeout=(10.0, max(10.0, timeout)),
+					)
+					if resp.status_code == 200:
+						data = resp.json()
+						break
+
+					if resp.status_code in (408, 429, 500, 502, 503, 504):
+						if attempt <= retries:
+							logger.warning(
+								"Solr Retry %s/%s: HTTP %s; start=%s",
+								attempt,
+								retries,
+								resp.status_code,
+								start,
+							)
+							_sleep_backoff(backoff, attempt)
+							continue
+						logger.error(
+							"Solr-Abfrage fehlgeschlagen nach Retries: HTTP %s; start=%s; body=%s",
+							resp.status_code,
+							start,
+							resp.text[:2000],
+						)
+						resp.raise_for_status()
+
+					logger.error(
+						"Solr-Abfrage fehlgeschlagen: HTTP %s; start=%s; body=%s",
+						resp.status_code,
+						start,
+						resp.text[:2000],
+					)
+					resp.raise_for_status()
+				except (requests.Timeout, requests.ConnectionError, json.JSONDecodeError) as exc:
+					if attempt <= retries:
+						logger.warning(
+							"Solr Retry %s/%s: %s; start=%s",
+							attempt,
+							retries,
+							type(exc).__name__,
+							start,
+						)
+						_sleep_backoff(backoff, attempt)
+						continue
+					logger.exception("Solr-Abfrage final fehlgeschlagen: start=%s", start)
+					raise
+
+			if data is None:
+				raise RuntimeError(f"Solr-Abfrage lieferte keine Daten; start={start}")
+
 			response = data.get("response") or {}
 			if total is None:
 				total = int(response.get("numFound") or 0)
@@ -443,7 +498,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 				search_url=search_url,
 				query=args.query,
 				rows=args.rows,
-				timeout=args.timeout,
+				timeout=args.solr_timeout,
+				retries=args.retries,
+				backoff=args.backoff,
 				logger=logger,
 			)
 		except Exception:
