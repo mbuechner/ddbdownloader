@@ -107,7 +107,7 @@ class App(tk.Tk):
 		btns.grid(row=5, column=1, sticky="w", pady=(10, 0))
 		self.btn_start = tk.Button(btns, text="Start", width=12, command=self._start)
 		self.btn_start.pack(side=tk.LEFT)
-		self.btn_stop = tk.Button(btns, text="Stop", width=12, state=tk.DISABLED, command=self._stop)
+		self.btn_stop = tk.Button(btns, text="Stopp", width=12, state=tk.DISABLED, command=self._stop)
 		self.btn_stop.pack(side=tk.LEFT, padx=(8, 0))
 
 		# Status line
@@ -117,13 +117,17 @@ class App(tk.Tk):
 		# Output text
 		out_frame = tk.Frame(self)
 		out_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+		out_frame.grid_rowconfigure(0, weight=1)
+		out_frame.grid_columnconfigure(0, weight=1)
 
 		self.txt = tk.Text(out_frame, wrap="none")
-		self.txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+		self.txt.grid(row=0, column=0, sticky="nsew")
 
 		scroll_y = tk.Scrollbar(out_frame, orient="vertical", command=self.txt.yview)
-		scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-		self.txt.configure(yscrollcommand=scroll_y.set)
+		scroll_y.grid(row=0, column=1, sticky="ns")
+		scroll_x = tk.Scrollbar(out_frame, orient="horizontal", command=self.txt.xview)
+		scroll_x.grid(row=1, column=0, sticky="ew")
+		self.txt.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
 
 		# Make column 1 expand
 		frm.grid_columnconfigure(1, weight=1)
@@ -206,6 +210,7 @@ class App(tk.Tk):
 				messagebox.showerror("Fehler", f"Nicht gefunden: {DOWNLOADER_PY}")
 				return
 
+		self.txt.delete("1.0", tk.END)
 		self._append_text(f"Starte: {' '.join(cmd)}\n")
 		self._set_status("Starte Download…")
 
@@ -244,11 +249,34 @@ class App(tk.Tk):
 		p = self.proc
 		if p is None:
 			return
+		self.btn_stop.configure(state=tk.DISABLED)
+		self.msg_queue.put(("line", "\nStopp angefordert (bis zu 15 Sekunden Wartezeit)…\n"))
+		threading.Thread(target=self._stop_worker, args=(p,), daemon=True).start()
+
+	def _stop_worker(self, p: subprocess.Popen) -> None:
+		"""Beendet den Prozess kooperativ und notfalls erzwungen (portable Lösung)."""
 		try:
-			self._append_text("\nStop angefordert…\n")
-			p.terminate()
-		except Exception:
-			pass
+			# Phase 1: Sanftes terminate() (Timeout: 10 s)
+			# Funktioniert überall: sendet SIGTERM (Unix) oder TerminateProcess (Windows)
+			self.msg_queue.put(("line", "Beende Prozess sauber…\n"))
+			try:
+				p.terminate()
+				p.wait(timeout=10)
+				self.msg_queue.put(("line", "Prozess sauber beendet.\n"))
+				return
+			except subprocess.TimeoutExpired:
+				pass
+
+			# Phase 2: Erzwungener Abbruch mit kill() (Timeout: 5 s)
+			# Funktioniert überall: sendet SIGKILL (Unix) oder TerminateProcess (Windows)
+			self.msg_queue.put(("line", "Erzwinge Abbruch…\n"))
+			p.kill()
+			p.wait(timeout=5)
+			self.msg_queue.put(("line", "Prozess beendet.\n"))
+		except subprocess.TimeoutExpired:
+			self.msg_queue.put(("line", "Warnung: Prozess konnte nicht beendet werden.\n"))
+		except Exception as exc:
+			self.msg_queue.put(("line", f"Fehler beim Beenden: {exc}\n"))
 
 	def _reader_worker(self):
 		assert self.proc is not None

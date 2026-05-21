@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import sys
 import tempfile
 import threading
@@ -22,6 +23,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Iterable, Optional, Tuple
+
+
+# Kooperatives Stop-Signal: wird von Signal-Handlern und dem GUI gesetzt.
+_stop_event = threading.Event()
 
 
 try:
@@ -246,6 +251,11 @@ def _solr_fetch_ids(
 
 	try:
 		while True:
+			if _stop_event.is_set():
+				logger.info("_stop_event ist gesetzt - beende Solr-Schleife")
+				sys.stderr.write("\n>>> _stop_event erkannt - fahre herunter\n")
+				sys.stderr.flush()
+				break
 			params = {
 				"q": query,
 				"fl": "id",
@@ -257,12 +267,16 @@ def _solr_fetch_ids(
 
 			data = None
 			for attempt in range(1, retries + 2):
+				if _stop_event.is_set():
+					break
 				try:
 					resp = session.get(
 						search_url,
 						params=params,
 						timeout=(10.0, max(10.0, timeout)),
 					)
+					if _stop_event.is_set():
+						break
 					if resp.status_code == 200:
 						data = resp.json()
 						break
@@ -376,10 +390,36 @@ def _download_one(
 	return resp.status_code, resp.content
 
 
+def _setup_signal_handlers() -> None:
+	"""Installiert SIGTERM- und SIGBREAK-Handler, die _stop_event setzen statt abzustürzen."""
+	def _handle(signum, frame):  # noqa: ARG001
+		_stop_event.set()
+		print(f"\n>>> Signal {signum} empfangen - fahre Downloader herunter...", file=sys.stderr)
+		sys.stderr.flush()
+
+	for sig in (signal.SIGTERM,):
+		try:
+			signal.signal(sig, _handle)
+		except (OSError, AttributeError, ValueError):
+			pass
+
+	# Windows: Ctrl+Break sendet SIGBREAK -> sonst KeyboardInterrupt
+	sigbreak = getattr(signal, "SIGBREAK", None)
+	if sigbreak is not None:
+		try:
+			signal.signal(sigbreak, _handle)
+		except (OSError, AttributeError, ValueError):
+			pass
+
+
 def _sleep_backoff(base: float, attempt: int) -> None:
-	# attempt: 1..N
+	# attempt: 1..N – in kleinen Schritten, damit _stop_event schnell bemerkt wird.
 	delay = base * (2 ** (attempt - 1))
-	time.sleep(delay)
+	deadline = time.monotonic() + delay
+	while time.monotonic() < deadline:
+		if _stop_event.is_set():
+			return
+		time.sleep(min(0.2, deadline - time.monotonic()))
 
 
 def _status_loop(stop_event: threading.Event, counters: Counters, phase_getter, started_at: float) -> None:
@@ -469,6 +509,9 @@ class ZipRotatingWriter:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
+	_stop_event.clear()
+	_setup_signal_handlers()
+
 	args = _parse_args(argv)
 
 	if not args.head_only and not args.output:
@@ -508,6 +551,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 			return 2
 
 	print(f"Gefundene IDs: {_fmt_int_de(total_ids)}")
+
+	if _stop_event.is_set():
+		logger.info("Abbruch durch Stop-Signal nach ID-Sammlung.")
+		try:
+			os.unlink(ids_path)
+		except Exception:
+			pass
+		return 130
 
 	# Schritt 2: Download + ZIP
 	counters = Counters(total_ids=total_ids)
@@ -567,6 +618,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 		return s
 
 	def download_task(item_id: str) -> None:
+		if _stop_event.is_set():
+			return
 		nonlocal counters
 		s = get_session()
 
@@ -690,6 +743,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 		with ThreadPoolExecutor(max_workers=max_workers) as pool:
 			futures = set()
 			for _id in _iter_ids_from_file(ids_path):
+				if _stop_event.is_set():
+					break
 				futures.add(pool.submit(download_task, _id))
 				if len(futures) >= max_outstanding:
 					done, futures = wait(futures, return_when=FIRST_COMPLETED)
@@ -708,12 +763,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 					except Exception:
 						pass
 
-		# Alle Downloads fertig -> Writer beenden
+	except KeyboardInterrupt:
+		_stop_event.set()
+		logger.info("Abbruch durch KeyboardInterrupt.")
+	finally:
+		# Writer in jedem Fall (auch bei Abbruch) sauber beenden
 		if writer_thread is not None:
 			q_items.put(None)
 			writer_thread.join()
-
-	finally:
 		phase["value"] = "final"
 		status_stop.set()
 		try:
