@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import sys
 import tempfile
@@ -43,6 +44,16 @@ API_BASES = (
 	"https://api-q1.deutsche-digitale-bibliothek.de/2",
 )
 
+DOWNLOAD_TARGETS = {
+	"edm-europeana": ("EDM (Europeana)", "/items/{id}/edm", "xml", True),
+	"edm-ddb": ("EDM (DDB)", "/items/{id}/edm", "xml", False),
+	"aip": ("AIP", "/items/{id}", "json", False),
+	"binaries": ("Binaries", "/items/{id}/binaries", "bin", False),
+	"iiif": ("IIIF", "/items/{id}/iiif", "json", False),
+	"source": ("Source", "/items/{id}/source/record", "xml", False),
+	"view": ("View", "/items/{id}/view", "html", False),
+}
+
 
 def _normalize_api_base(value: str) -> str:
 	v = (value or "").strip()
@@ -58,8 +69,8 @@ def _search_url(api_base: str) -> str:
 	return f"{api_base}/search/index/search/select"
 
 
-def _item_url_tmpl(api_base: str) -> str:
-	return f"{api_base}/items/{{id}}/edm"
+def _item_url_tmpl(api_base: str, target: str) -> str:
+	return f"{api_base}{DOWNLOAD_TARGETS[target][1]}"
 
 DEFAULT_ROWS = 100_000
 DEFAULT_THREADS = 16
@@ -78,9 +89,20 @@ def _fmt_float_de(value: float, decimals: int = 1) -> str:
 	return s.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
 
 
+def _fmt_bytes(value: float) -> str:
+	units = ("B", "KiB", "MiB", "GiB", "TiB")
+	value = max(0.0, value)
+	for unit in units:
+		if value < 1024.0 or unit == units[-1]:
+			return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+		value /= 1024.0
+	return "0 B"
+
+
 @dataclass
 class Counters:
 	total_ids: int = 0
+	resumed: int = 0
 	downloaded_ok: int = 0
 	downloaded_empty: int = 0
 	no_edm: int = 0
@@ -90,6 +112,7 @@ class Counters:
 	queued_to_zip: int = 0
 	written_to_zip: int = 0
 	zip_files_created: int = 0
+	downloaded_bytes: int = 0
 
 
 def _configure_logger(log_path: str, verbose: bool) -> logging.Logger:
@@ -125,8 +148,8 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 	p = argparse.ArgumentParser(
 		prog="DDBdownloader",
 		description=(
-			"Massendownload von EDM-XML über die API der Deutschen Digitalen Bibliothek. "
-			"Ablauf: Solr-Suche -> IDs seitenweise sammeln -> parallel EDM laden -> in ZIP schreiben. "
+			"Massendownload von DDB-Objektdaten über die API der Deutschen Digitalen Bibliothek. "
+			"Ablauf: Solr-Suche -> IDs seitenweise sammeln -> parallel laden -> in ZIP schreiben. "
 			"Fehler/Timeouts werden geloggt; am Ende wird eine Statistik ausgegeben."
 		),
 	)
@@ -135,7 +158,18 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 		"-o",
 		"--output",
 		default="",
-		help='Output ZIP, z.B. "output.zip" (Logdatei wird daneben als output.log angelegt). Im --head-only Modus optional.',
+		help='Output ZIP, z.B. "output.zip" (Logdatei wird daneben als output.log angelegt). Vorhandene ZIPs werden standardmäßig fortgesetzt.',
+	)
+	p.add_argument(
+		"--target",
+		choices=tuple(DOWNLOAD_TARGETS),
+		default="edm-europeana",
+		help="Zu ladender Endpunkt (Default: edm-europeana).",
+	)
+	p.add_argument(
+		"--no-resume",
+		action="store_true",
+		help="Vorhandene ZIP-Ausgabe nicht fortsetzen, sondern überschreiben.",
 	)
 	p.add_argument(
 		"-b",
@@ -165,7 +199,13 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 		"--rows",
 		type=int,
 		default=DEFAULT_ROWS,
-		help="IDs pro Seite bei der Solr-Abfrage (Default: 100000)",
+		help="IDs pro Solr-Seite (Default: 100000)",
+	)
+	p.add_argument(
+		"--pagination",
+		choices=("cursor", "start"),
+		default="cursor",
+		help="Solr-Paginierung: cursor (Standard) oder start für Offset-Paginierung.",
 	)
 	p.add_argument(
 		"--timeout",
@@ -201,7 +241,7 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 		action="store_true",
 		help=(
 			"Nur HEAD-Requests senden (kein Download, kein ZIP). "
-			"Prüft, wie viele IDs tatsächlich ein EDM besitzen. "
+			"Prüft, wie viele IDs für das gewählte Ziel vorhanden sind. "
 			"404/409 gelten als 'kein EDM'; andere Fehler bekommen Retries."
 		),
 	)
@@ -217,12 +257,10 @@ def _output_zip_name(base_output: str, index: int, use_split: bool) -> str:
 	return f"{root}-{index}{ext}"
 
 
-def _http_headers() -> Dict[str, str]:
-	headers = {
-		"Accept": "application/xml",
-		"accept-profile": "https://www.deutsche-digitale-bibliothek.de/ns/europeana-edm-profile",
-		"User-Agent": "DDBdownloader/1.0",
-	}
+def _http_headers(target: str) -> Dict[str, str]:
+	headers = {"Accept": "application/xml", "User-Agent": "DDBdownloader/1.1"}
+	if target == "edm-europeana":
+		headers["accept-profile"] = "https://www.deutsche-digitale-bibliothek.de/ns/europeana-edm-profile"
 	return headers
 
 
@@ -231,6 +269,7 @@ def _solr_fetch_ids(
 	search_url: str,
 	query: str,
 	rows: int,
+	pagination: str,
 	timeout: float,
 	retries: int,
 	backoff: float,
@@ -243,11 +282,13 @@ def _solr_fetch_ids(
 	tmp = tempfile.NamedTemporaryFile(prefix="ddb_ids_", suffix=".txt", delete=False, mode="w", encoding="utf-8")
 	tmp_path = tmp.name
 
+	cursor_mark = "*"
 	start = 0
+	ids_read = 0
 	total = None
 	last_print = 0.0
 
-	logger.info("Starte ID-Sammlung über Solr: rows=%s", rows)
+	logger.info("Starte ID-Sammlung über Solr: pagination=%s rows=%s", pagination, rows)
 
 	try:
 		while True:
@@ -260,10 +301,15 @@ def _solr_fetch_ids(
 				"q": query,
 				"fl": "id",
 				"sort": "id ASC",
-				"start": start,
 				"rows": rows,
 				"wt": "json",
 			}
+			if pagination == "cursor":
+				params["cursorMark"] = cursor_mark
+			else:
+				params["start"] = start
+			position = cursor_mark if pagination == "cursor" else start
+			position_name = "cursor" if pagination == "cursor" else "start"
 
 			data = None
 			for attempt in range(1, retries + 2):
@@ -284,45 +330,53 @@ def _solr_fetch_ids(
 					if resp.status_code in (408, 429, 500, 502, 503, 504):
 						if attempt <= retries:
 							logger.warning(
-								"Solr Retry %s/%s: HTTP %s; start=%s",
+								"Solr %s Retry %s/%s: HTTP %s; %s=%s",
+								pagination,
 								attempt,
 								retries,
 								resp.status_code,
-								start,
+								position_name,
+								position,
 							)
 							_sleep_backoff(backoff, attempt)
 							continue
 						logger.error(
-							"Solr-Abfrage fehlgeschlagen nach Retries: HTTP %s; start=%s; body=%s",
+							"Solr %s-Abfrage fehlgeschlagen nach Retries: HTTP %s; %s=%s; body=%s",
+							pagination,
 							resp.status_code,
-							start,
+							position_name,
+							position,
 							resp.text[:2000],
 						)
 						resp.raise_for_status()
 
 					logger.error(
-						"Solr-Abfrage fehlgeschlagen: HTTP %s; start=%s; body=%s",
+						"Solr %s-Abfrage fehlgeschlagen: HTTP %s; %s=%s; body=%s",
+						pagination,
 						resp.status_code,
-						start,
+						position_name,
+						position,
 						resp.text[:2000],
 					)
 					resp.raise_for_status()
 				except (requests.Timeout, requests.ConnectionError, json.JSONDecodeError) as exc:
 					if attempt <= retries:
 						logger.warning(
-							"Solr Retry %s/%s: %s; start=%s",
+							"Solr %s Retry %s/%s: %s; %s=%s",
+							pagination,
 							attempt,
 							retries,
 							type(exc).__name__,
-							start,
+							position_name,
+							position,
 						)
 						_sleep_backoff(backoff, attempt)
 						continue
-					logger.exception("Solr-Abfrage final fehlgeschlagen: start=%s", start)
+					logger.exception("Solr %s-Abfrage final fehlgeschlagen: %s=%s", pagination, position_name, position)
 					raise
 
 			if data is None:
-				raise RuntimeError(f"Solr-Abfrage lieferte keine Daten; start={start}")
+				raise RuntimeError(f"Solr {pagination}-Abfrage lieferte keine Daten; {position_name}={position}")
 
 			response = data.get("response") or {}
 			if total is None:
@@ -338,25 +392,33 @@ def _solr_fetch_ids(
 					continue
 				tmp.write(str(_id))
 				tmp.write("\n")
-				start += 1
+				ids_read += 1
 
 			now = time.time()
 			if now - last_print >= 1.0:
 				last_print = now
 				# Status in STDERR, ohne Log zu fluten
 				if total is not None and total > 0:
-					pct = min(100.0, (start / total) * 100.0)
+					pct = min(100.0, (ids_read / total) * 100.0)
 					pct_s = _fmt_float_de(pct, 1).rjust(4)
 					sys.stderr.write(
-						f"\rIDs gelesen: {_fmt_int_de(start)}/{_fmt_int_de(total)} ({pct_s}%)"
+						f"\rIDs gelesen: {_fmt_int_de(ids_read)}/{_fmt_int_de(total)} ({pct_s}%)"
 					)
 				else:
-					sys.stderr.write(f"\rIDs gelesen: {_fmt_int_de(start)}")
+					sys.stderr.write(f"\rIDs gelesen: {_fmt_int_de(ids_read)}")
 				sys.stderr.flush()
 
-			# Wenn numFound bekannt ist und wir alles haben: Abbruch
-			if total is not None and start >= total:
-				break
+			if pagination == "cursor":
+				next_cursor_mark = data.get("nextCursorMark")
+				if not next_cursor_mark:
+					raise RuntimeError("Solr CursorMark-Antwort enthält kein nextCursorMark")
+				if next_cursor_mark == cursor_mark:
+					break
+				cursor_mark = str(next_cursor_mark)
+			else:
+				start += len(docs)
+				if total is not None and start >= total:
+					break
 
 	finally:
 		tmp.close()
@@ -364,10 +426,10 @@ def _solr_fetch_ids(
 		sys.stderr.flush()
 
 	if total is None:
-		total = start
+		total = ids_read
 
-	logger.info("ID-Sammlung beendet: total_ids=%s; tmp=%s", f"{start:,}", tmp_path)
-	return tmp_path, start
+	logger.info("ID-Sammlung beendet: total_ids=%s; tmp=%s", f"{ids_read:,}", tmp_path)
+	return tmp_path, ids_read
 
 
 def _iter_ids_from_file(path: str) -> Iterable[str]:
@@ -429,22 +491,33 @@ def _status_loop(stop_event: threading.Event, counters: Counters, phase_getter, 
 		time.sleep(1.0)
 		phase = phase_getter()
 		elapsed = max(0.001, time.time() - started_at)
-		done = counters.downloaded_ok + counters.downloaded_empty + counters.http_errors + counters.exceptions
+		done = counters.resumed + counters.downloaded_ok + counters.downloaded_empty + counters.no_edm + counters.http_errors + counters.exceptions
 		rate = done / elapsed
+		byte_rate = counters.downloaded_bytes / elapsed
 		eta = None
+		estimated_total_bytes = None
 		if counters.total_ids > 0 and rate > 0:
 			remaining = max(0, counters.total_ids - done)
 			eta = remaining / rate
+		if counters.downloaded_ok > 0:
+			estimated_total_bytes = counters.downloaded_bytes / counters.downloaded_ok * counters.total_ids
 
 		line = (
 			f"\r[{phase}] done={_fmt_int_de(done)}/{_fmt_int_de(counters.total_ids)} "
-			f"ok={_fmt_int_de(counters.downloaded_ok)} empty={_fmt_int_de(counters.downloaded_empty)} "
-			f"http={_fmt_int_de(counters.http_errors)} exc={_fmt_int_de(counters.exceptions)} "
-			f"retries={_fmt_int_de(counters.retries)} zip={_fmt_int_de(counters.written_to_zip)} "
-			f"rate={_fmt_float_de(rate, 1)}/s"
+			f"rate={_fmt_float_de(rate, 1)}/s size={_fmt_bytes(counters.downloaded_bytes)}"
 		)
+		if estimated_total_bytes is not None:
+			line += f"/~{_fmt_bytes(estimated_total_bytes)}"
 		if eta is not None:
 			line += f" ETA={_fmt_float_de(eta/60, 1)} min"
+		if byte_rate > 0:
+			line += f" {_fmt_bytes(byte_rate)}/s"
+		line += (
+			f" ok={_fmt_int_de(counters.downloaded_ok)} resume={_fmt_int_de(counters.resumed)} "
+			f"no={_fmt_int_de(counters.no_edm)} http={_fmt_int_de(counters.http_errors)} "
+			f"exc={_fmt_int_de(counters.exceptions)} retries={_fmt_int_de(counters.retries)} "
+			f"zip={_fmt_int_de(counters.written_to_zip)}"
+		)
 
 		# Auf 200 Zeichen begrenzen, aber alte Restzeichen überschreiben.
 		line = line[:200]
@@ -462,14 +535,59 @@ def _status_loop(stop_event: threading.Event, counters: Counters, phase_getter, 
 	sys.stderr.flush()
 
 
+def _existing_zip_paths(base_output: str, use_split: bool) -> list[Tuple[int, str]]:
+	if not use_split:
+		return [(1, base_output)] if os.path.exists(base_output) else []
+
+	root, ext = os.path.splitext(base_output)
+	if not ext:
+		ext = ".zip"
+	pattern = re.compile(rf"^{re.escape(os.path.basename(root))}-(\d+){re.escape(ext)}$")
+	directory = os.path.dirname(os.path.abspath(base_output)) or "."
+	paths = []
+	for name in os.listdir(directory):
+		match = pattern.match(name)
+		if match:
+			paths.append((int(match.group(1)), os.path.join(directory, name)))
+	return sorted(paths)
+
+
+def _completed_archive_ids(base_output: str, use_split: bool, logger: logging.Logger) -> set[str]:
+	completed_ids = set()
+	for _, path in _existing_zip_paths(base_output, use_split):
+		try:
+			with zipfile.ZipFile(path, mode="r") as archive:
+				for info in archive.infolist():
+					if not info.is_dir() and info.file_size > 0:
+						item_id, separator, _ = info.filename.rpartition(".")
+						if separator:
+							completed_ids.add(item_id)
+		except (OSError, zipfile.BadZipFile):
+			corrupt_path = f"{path}.corrupt-{int(time.time())}"
+			try:
+				os.replace(path, corrupt_path)
+				logger.warning("Beschädigtes ZIP für Resume ausgesondert: %s", corrupt_path)
+			except OSError:
+				logger.warning("Beschädigtes ZIP wird nicht fortgesetzt: %s", path)
+	return completed_ids
+
+
+def _remove_existing_archives(base_output: str, use_split: bool) -> None:
+	for _, path in _existing_zip_paths(base_output, use_split):
+		os.unlink(path)
+
+
 class ZipRotatingWriter:
-	def __init__(self, base_output: str, batch_size: int, logger: logging.Logger):
+	def __init__(self, base_output: str, batch_size: int, extension: str, resume: bool, logger: logging.Logger):
 		self.base_output = base_output
 		self.batch_size = batch_size
 		self.use_split = bool(batch_size and batch_size > 0)
+		self.extension = extension
+		self.resume = resume
 		self.logger = logger
 
-		self._zip_index = 1
+		existing = _existing_zip_paths(base_output, self.use_split) if resume else []
+		self._zip_index = existing[-1][0] if existing else 1
 		self._zip = None  # type: Optional[zipfile.ZipFile]
 		self._zip_count = 0
 
@@ -480,11 +598,12 @@ class ZipRotatingWriter:
 
 		zip_name = _output_zip_name(self.base_output, self._zip_index, self.use_split)
 		os.makedirs(os.path.dirname(os.path.abspath(zip_name)) or ".", exist_ok=True)
-		self._zip = zipfile.ZipFile(zip_name, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9)
-		self._zip_count = 0
+		mode = "a" if self.resume and os.path.exists(zip_name) else "w"
+		self._zip = zipfile.ZipFile(zip_name, mode=mode, compression=zipfile.ZIP_DEFLATED, compresslevel=9)
+		self._zip_count = len(self._zip.infolist())
 		self.logger.info("ZIP geöffnet: %s", zip_name)
 
-	def write_xml(self, item_id: str, xml_bytes: bytes) -> None:
+	def write_item(self, item_id: str, content: bytes) -> None:
 		if self._zip is None:
 			self._open_new_zip()
 
@@ -493,9 +612,9 @@ class ZipRotatingWriter:
 			self._zip_index += 1
 			self._open_new_zip()
 
-		arcname = f"{item_id}.xml"
+		arcname = f"{item_id}.{self.extension}"
 		assert self._zip is not None, "ZIP file is not open"
-		self._zip.writestr(arcname, xml_bytes)
+		self._zip.writestr(arcname, content)
 		self._zip_count += 1
 
 	def close(self) -> None:
@@ -527,7 +646,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
 	api_base = _normalize_api_base(args.api)
 	search_url = _search_url(api_base)
-	item_url_tmpl = _item_url_tmpl(api_base)
+	item_url_tmpl = _item_url_tmpl(api_base, args.target)
 
 	logger.info("API: %s", api_base)
 
@@ -541,6 +660,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 				search_url=search_url,
 				query=args.query,
 				rows=args.rows,
+				pagination=args.pagination,
 				timeout=args.solr_timeout,
 				retries=args.retries,
 				backoff=args.backoff,
@@ -551,6 +671,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 			return 2
 
 	print(f"Gefundene IDs: {_fmt_int_de(total_ids)}")
+	print(f"Ziel: {DOWNLOAD_TARGETS[args.target][0]}")
 
 	if _stop_event.is_set():
 		logger.info("Abbruch durch Stop-Signal nach ID-Sammlung.")
@@ -561,9 +682,19 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 		return 130
 
 	# Schritt 2: Download + ZIP
+	resume = not args.no_resume
+	completed_ids = set()
+	if not args.head_only:
+		if resume:
+			completed_ids = _completed_archive_ids(args.output, bool(args.batch and args.batch > 0), logger)
+			if completed_ids:
+				print(f"Fortsetzen: {_fmt_int_de(len(completed_ids))} vorhandene Archiv-Einträge werden übersprungen.")
+		else:
+			_remove_existing_archives(args.output, bool(args.batch and args.batch > 0))
+
 	counters = Counters(total_ids=total_ids)
 	counters_lock = threading.Lock()
-	headers = _http_headers()
+	headers = _http_headers(args.target)
 	q_items: "queue.Queue[Optional[Tuple[str, bytes]]]" = queue.Queue(maxsize=5000)
 	writer_stop = threading.Event()
 	phase = {"value": "download"}
@@ -579,7 +710,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	status_thread.start()
 
 	def writer_worker() -> None:
-		zw = ZipRotatingWriter(args.output, args.batch, logger)
+		zw = ZipRotatingWriter(
+			args.output,
+			args.batch,
+			DOWNLOAD_TARGETS[args.target][2],
+			resume,
+			logger,
+		)
 		try:
 			# mindestens eine ZIP als „created“ zählen, sobald sie geöffnet wird
 			while True:
@@ -588,7 +725,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 					break
 				item_id, xml_bytes = item
 				try:
-					zw.write_xml(item_id, xml_bytes)
+					zw.write_item(item_id, xml_bytes)
 					with counters_lock:
 						counters.written_to_zip += 1
 				except Exception:
@@ -598,7 +735,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 		finally:
 			try:
 				zw.close()
-				counters.zip_files_created = zw.zip_index if (args.batch and args.batch > 0) else (1 if counters.written_to_zip > 0 else 0)
+				counters.zip_files_created = len(_existing_zip_paths(args.output, bool(args.batch and args.batch > 0)))
 			except Exception:
 				logger.exception("Fehler beim Schließen der ZIP")
 
@@ -693,6 +830,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 					with counters_lock:
 						counters.queued_to_zip += 1
 						counters.downloaded_ok += 1
+						counters.downloaded_bytes += len(body)
 					return
 
 				# Kein EDM vorhanden – kein Retry
@@ -745,6 +883,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 			for _id in _iter_ids_from_file(ids_path):
 				if _stop_event.is_set():
 					break
+				if _id in completed_ids:
+					with counters_lock:
+						counters.resumed += 1
+					continue
 				futures.add(pool.submit(download_task, _id))
 				if len(futures) >= max_outstanding:
 					done, futures = wait(futures, return_when=FIRST_COMPLETED)
@@ -785,7 +927,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 	# Abschluss
 	sys.stderr.write("\n")
 	elapsed = max(0.001, time.time() - started_at)
-	done = counters.downloaded_ok + counters.downloaded_empty + counters.no_edm + counters.http_errors + counters.exceptions
+	done = counters.resumed + counters.downloaded_ok + counters.downloaded_empty + counters.no_edm + counters.http_errors + counters.exceptions
 	rate = done / elapsed
 
 	if args.head_only:
@@ -803,6 +945,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 		"api_base": api_base,
 		"total_ids": counters.total_ids,
 		"done": done,
+		"resumed": counters.resumed,
 		"with_edm": counters.downloaded_ok,
 		"without_edm": counters.no_edm,
 		"downloaded_ok": counters.downloaded_ok,
@@ -814,9 +957,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 		"zip_files_created": counters.zip_files_created,
 		"elapsed_seconds": elapsed,
 		"rate_per_second": rate,
+		"downloaded_bytes": counters.downloaded_bytes,
+		"estimated_total_bytes": (counters.downloaded_bytes / counters.downloaded_ok * counters.total_ids) if counters.downloaded_ok else None,
 		"output": args.output,
 		"batch": args.batch,
 		"threads": args.threads,
+		"pagination": args.pagination,
+		"target": args.target,
+		"resume": resume,
 	}
 
 	if not args.head_only:

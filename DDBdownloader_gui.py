@@ -1,5 +1,6 @@
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -15,6 +16,16 @@ API_BASES = [
 	"https://api.deutsche-digitale-bibliothek.de/2",
 	"https://api-q1.deutsche-digitale-bibliothek.de/2",
 ]
+
+DOWNLOAD_TARGETS = {
+	"EDM (Europeana-Profil)": "edm-europeana",
+	"EDM (DDB)": "edm-ddb",
+	"AIP": "aip",
+	"Binaries": "binaries",
+	"IIIF": "iiif",
+	"Source": "source",
+	"View": "view",
+}
 
 
 def _is_frozen() -> bool:
@@ -70,25 +81,45 @@ class App(tk.Tk):
 		api_menu = tk.OptionMenu(frm, self.var_api, *API_BASES)
 		api_menu.grid(row=0, column=1, sticky="w", padx=(5, 0))
 
+		# Download target
+		tk.Label(frm, text="Ziel:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+		self.var_target = tk.StringVar(value="EDM (Europeana-Profil)")
+		target_menu = tk.OptionMenu(frm, self.var_target, *DOWNLOAD_TARGETS)
+		target_menu.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
+
+		# Solr pagination
+		tk.Label(frm, text="ID-Paginierung:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+		self.var_pagination = tk.StringVar(value="cursor")
+		pagination_menu = tk.OptionMenu(frm, self.var_pagination, "cursor", "start")
+		pagination_menu.grid(row=2, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
+
 		# Query
-		tk.Label(frm, text="Query (-q):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+		tk.Label(frm, text="Query (-q):").grid(row=3, column=0, sticky="w", pady=(6, 0))
 		self.var_query = tk.StringVar(value='dataset_id:')
-		tk.Entry(frm, textvariable=self.var_query, width=80).grid(row=1, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
+		tk.Entry(frm, textvariable=self.var_query, width=80).grid(row=3, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
 
 		# Output
-		tk.Label(frm, text="Output ZIP (-o):").grid(row=2, column=0, sticky="w", pady=(6, 0))
+		tk.Label(frm, text="Output ZIP (-o):").grid(row=4, column=0, sticky="w", pady=(6, 0))
 		self.var_output = tk.StringVar(value=os.path.join(SCRIPT_DIR, "output.zip"))
 		out_entry = tk.Entry(frm, textvariable=self.var_output, width=80)
-		out_entry.grid(row=2, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
+		out_entry.grid(row=4, column=1, sticky="we", padx=(5, 5), pady=(6, 0))
 		out_btn = tk.Button(frm, text="…", width=3, command=self._browse_output)
-		out_btn.grid(row=2, column=2, pady=(6, 0))
-		self._output_widgets = [out_entry, out_btn]
+		out_btn.grid(row=4, column=2, pady=(6, 0))
 
 		# Batch + Threads
-		tk.Label(frm, text="Batchgröße ZIP (-b):").grid(row=3, column=0, sticky="w", pady=(6, 0))
+		tk.Label(frm, text="Batchgröße ZIP (-b):").grid(row=5, column=0, sticky="w", pady=(6, 0))
 		self.var_batch = tk.StringVar(value="0")
 		batch_entry = tk.Entry(frm, textvariable=self.var_batch, width=12)
-		batch_entry.grid(row=3, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
+		batch_entry.grid(row=5, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
+
+		self.var_resume = tk.BooleanVar(value=True)
+		resume_chk = tk.Checkbutton(
+			frm,
+			text="Vorhandene ZIPs sicher fortsetzen",
+			variable=self.var_resume,
+		)
+		resume_chk.grid(row=6, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
+		self._output_widgets = [out_entry, out_btn, batch_entry, resume_chk]
 
 		# HEAD-only Modus
 		self.var_head_only = tk.BooleanVar(value=False)
@@ -98,13 +129,13 @@ class App(tk.Tk):
 			variable=self.var_head_only,
 			command=self._on_head_only_toggle,
 		)
-		head_chk.grid(row=4, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
+		head_chk.grid(row=7, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
 
 		# Threads sind bewusst nicht konfigurierbar – der Downloader nutzt Default=16.
 
 		# Buttons
 		btns = tk.Frame(frm)
-		btns.grid(row=5, column=1, sticky="w", pady=(10, 0))
+		btns.grid(row=8, column=1, sticky="w", pady=(10, 0))
 		self.btn_start = tk.Button(btns, text="Start", width=12, command=self._start)
 		self.btn_start.pack(side=tk.LEFT)
 		self.btn_stop = tk.Button(btns, text="Stopp", width=12, state=tk.DISABLED, command=self._stop)
@@ -156,10 +187,17 @@ class App(tk.Tk):
 		self.last_status = s
 		self.lbl_status.configure(text=s)
 
-	def _validate(self) -> tuple[str, str, int, str, bool]:
+	def _validate(self) -> tuple[str, str, int, str, str, str, bool, bool]:
 		api = (self.var_api.get() or "").strip()
+		target_label = (self.var_target.get() or "").strip()
+		target = DOWNLOAD_TARGETS.get(target_label, "")
+		pagination = (self.var_pagination.get() or "").strip()
 		if not api:
 			raise ValueError("API ist leer.")
+		if not target:
+			raise ValueError("Ungültiges Download-Ziel.")
+		if pagination not in ("cursor", "start"):
+			raise ValueError("Ungültige ID-Paginierung.")
 		q = (self.var_query.get() or "").strip()
 		out = (self.var_output.get() or "").strip()
 		head_only = self.var_head_only.get()
@@ -172,14 +210,14 @@ class App(tk.Tk):
 		batch = int(batch_raw) if batch_raw else 0
 		if batch < 0:
 			raise ValueError("Batch (-b) muss >= 0 sein.")
-		return q, out, batch, api, head_only
+		return q, out, batch, api, target, pagination, head_only, self.var_resume.get()
 
 	def _start(self):
 		if self.proc is not None:
 			return
 
 		try:
-			q, out, batch, api, head_only = self._validate()
+			q, out, batch, api, target, pagination, head_only, resume = self._validate()
 		except Exception as exc:
 			messagebox.showerror("Ungültige Eingabe", str(exc))
 			return
@@ -187,6 +225,10 @@ class App(tk.Tk):
 		cmd = _downloader_command() + [
 			"--api",
 			api,
+			"--target",
+			target,
+			"--pagination",
+			pagination,
 			"-q",
 			q,
 		]
@@ -194,8 +236,11 @@ class App(tk.Tk):
 			cmd += ["-o", out]
 		if head_only:
 			cmd += ["--head-only"]
-		elif batch:
-			cmd += ["-b", str(batch)]
+		else:
+			if batch:
+				cmd += ["-b", str(batch)]
+			if not resume:
+				cmd += ["--no-resume"]
 
 		# Existenz-Check passend zum Modus
 		if _is_frozen():
@@ -220,7 +265,11 @@ class App(tk.Tk):
 			creationflags = 0
 			if os.name == "nt":
 				# Verhindert das Öffnen eines Konsolenfensters (z.B. bei DDBdownloader.exe).
-				creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+				# Die eigene Prozessgruppe erlaubt CTRL_BREAK_EVENT für einen sauberen ZIP-Abschluss.
+				creationflags = (
+					getattr(subprocess, "CREATE_NO_WINDOW", 0)
+					| getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+				)
 				startupinfo = subprocess.STARTUPINFO()
 				startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 				startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
@@ -257,10 +306,13 @@ class App(tk.Tk):
 		"""Beendet den Prozess kooperativ und notfalls erzwungen (portable Lösung)."""
 		try:
 			# Phase 1: Sanftes terminate() (Timeout: 10 s)
-			# Funktioniert überall: sendet SIGTERM (Unix) oder TerminateProcess (Windows)
+			# Windows erhält CTRL_BREAK_EVENT; der Downloader verarbeitet es als SIGBREAK und schließt ZIPs.
 			self.msg_queue.put(("line", "Beende Prozess sauber…\n"))
 			try:
-				p.terminate()
+				if os.name == "nt":
+					p.send_signal(signal.CTRL_BREAK_EVENT)
+				else:
+					p.terminate()
 				p.wait(timeout=10)
 				self.msg_queue.put(("line", "Prozess sauber beendet.\n"))
 				return
